@@ -43,10 +43,17 @@ int undo_last_action(Document *document, UndoState *undo_state);
 int insert_line(Document *document, UndoState *undo_state, int line_number,
                 const char *text);
 int delete_line(Document *document, UndoState *undo_state, int line_number);
+int append_line_command(Document *document, UndoState *undo_state,
+                        const char *text);
+int replace_line(Document *document, UndoState *undo_state, int line_number,
+                 const char *old_text, const char *new_text);
+int replace_all(Document *document, UndoState *undo_state,
+                const char *old_text, const char *new_text);
 void display_document(const Document *document);
 int save_document(const Document *document, const char *filename);
 int load_document(Document *document, UndoState *undo_state, const char *filename);
 void search_document(const Document *document, const char *query);
+void count_document(const Document *document);
 void show_statistics(const Document *document);
 
 /* Input, parsing, and command processing */
@@ -292,6 +299,239 @@ int delete_line(Document *document, UndoState *undo_state, int line_number)
     return 1;
 }
 
+int append_line_command(Document *document, UndoState *undo_state,
+                        const char *text)
+{
+    if (text == NULL || *text == '\0')
+    {
+        fprintf(stderr, "Error: append text cannot be empty.\n");
+        return 0;
+    }
+
+    if (!save_undo_state(document, undo_state))
+    {
+        return 0;
+    }
+
+    if (!append_line(document, text))
+    {
+        fprintf(stderr, "Error: unable to append the new line.\n");
+        clear_undo(undo_state);
+        return 0;
+    }
+
+    return 1;
+}
+
+static char *replace_first_occurrence(const char *source, const char *old_text,
+                                      const char *new_text)
+{
+    const char *match;
+    size_t source_length;
+    size_t old_length;
+    size_t new_length;
+    size_t prefix_length;
+    size_t result_length;
+    char *result;
+
+    if (old_text == NULL || *old_text == '\0')
+    {
+        return NULL;
+    }
+
+    old_length = strlen(old_text);
+    new_length = strlen(new_text);
+    source_length = strlen(source);
+    match = strstr(source, old_text);
+    if (match == NULL)
+    {
+        return NULL;
+    }
+
+    prefix_length = (size_t)(match - source);
+    result_length = source_length + 1 + (new_length > old_length ? (new_length - old_length) : 0);
+    result = malloc(result_length);
+    if (result == NULL)
+    {
+        return NULL;
+    }
+
+    memcpy(result, source, prefix_length);
+    memcpy(result + prefix_length, new_text, new_length);
+    memcpy(result + prefix_length + new_length,
+           match + old_length,
+           source_length - prefix_length - old_length + 1);
+    return result;
+}
+
+static char *replace_all_occurrences(const char *source, const char *old_text,
+                                     const char *new_text, int *matches)
+{
+    const char *cursor;
+    const char *match;
+    size_t source_length;
+    size_t old_length;
+    size_t new_length;
+    size_t total_length;
+    char *result;
+    char *write;
+    int count;
+
+    if (old_text == NULL || *old_text == '\0')
+    {
+        *matches = 0;
+        return NULL;
+    }
+
+    source_length = strlen(source);
+    old_length = strlen(old_text);
+    new_length = strlen(new_text);
+    cursor = source;
+    count = 0;
+    while ((match = strstr(cursor, old_text)) != NULL)
+    {
+        count++;
+        cursor = match + old_length;
+    }
+
+    if (count == 0)
+    {
+        *matches = 0;
+        return NULL;
+    }
+
+    total_length = source_length + 1;
+    if (new_length > old_length)
+    {
+        total_length += (size_t)count * (new_length - old_length);
+    }
+    else if (old_length > new_length)
+    {
+        total_length -= (size_t)count * (old_length - new_length);
+    }
+
+    result = malloc(total_length);
+    if (result == NULL)
+    {
+        *matches = -1;
+        return NULL;
+    }
+
+    write = result;
+    cursor = source;
+    while (*cursor != '\0')
+    {
+        match = strstr(cursor, old_text);
+        if (match == NULL)
+        {
+            size_t tail_length = strlen(cursor);
+            memcpy(write, cursor, tail_length + 1);
+            break;
+        }
+
+        {
+            size_t prefix_length = (size_t)(match - cursor);
+            memcpy(write, cursor, prefix_length);
+            write += prefix_length;
+            memcpy(write, new_text, new_length);
+            write += new_length;
+            cursor = match + old_length;
+        }
+    }
+
+    *write = '\0';
+    *matches = count;
+    return result;
+}
+
+int replace_line(Document *document, UndoState *undo_state, int line_number,
+                 const char *old_text, const char *new_text)
+{
+    char *updated_line;
+    int index;
+
+    if (line_number < 1 || line_number > document->size)
+    {
+        fprintf(stderr, "Error: line number must be from 1 to %d.\n",
+                document->size);
+        return 0;
+    }
+
+    if (old_text == NULL || *old_text == '\0')
+    {
+        fprintf(stderr, "Error: replacement text cannot be empty.\n");
+        return 0;
+    }
+
+    if (!save_undo_state(document, undo_state))
+    {
+        return 0;
+    }
+
+    index = line_number - 1;
+    updated_line = replace_first_occurrence(document->lines[index], old_text,
+                                            new_text);
+    if (updated_line == NULL)
+    {
+        fprintf(stderr, "Error: the text was not found on line %d.\n",
+                line_number);
+        clear_undo(undo_state);
+        return 0;
+    }
+
+    free(document->lines[index]);
+    document->lines[index] = updated_line;
+    return 1;
+}
+
+int replace_all(Document *document, UndoState *undo_state,
+                const char *old_text, const char *new_text)
+{
+    int total_matches = 0;
+    int index;
+
+    if (old_text == NULL || *old_text == '\0')
+    {
+        fprintf(stderr, "Error: replacement text cannot be empty.\n");
+        return 0;
+    }
+
+    if (!save_undo_state(document, undo_state))
+    {
+        return 0;
+    }
+
+    for (index = 0; index < document->size; index++)
+    {
+        int matches_this_line = 0;
+        char *updated_line = replace_all_occurrences(document->lines[index], old_text,
+                                                     new_text, &matches_this_line);
+
+        if (matches_this_line < 0)
+        {
+            fprintf(stderr, "Error: unable to allocate memory for replacement.\n");
+            clear_undo(undo_state);
+            return 0;
+        }
+
+        if (matches_this_line > 0)
+        {
+            total_matches += matches_this_line;
+            free(document->lines[index]);
+            document->lines[index] = updated_line;
+        }
+    }
+
+    if (total_matches == 0)
+    {
+        printf("No matching text found.\n");
+        clear_undo(undo_state);
+        return 0;
+    }
+
+    return 1;
+}
+
 void display_document(const Document *document)
 {
     if (document->size == 0)
@@ -517,20 +757,22 @@ static int count_words(const char *text)
     return words;
 }
 
-void show_statistics(const Document *document)
+void count_document(const Document *document)
 {
-    int words = 0;
-    size_t characters = 0;
+    int total_words = 0;
 
     for (int index = 0; index < document->size; index++)
     {
-        words += count_words(document->lines[index]);
-        characters += strlen(document->lines[index]);
+        total_words += count_words(document->lines[index]);
     }
 
-    printf("Lines: %d\n", document->size);
-    printf("Words: %d\n", words);
-    printf("Characters: %zu\n", characters);
+    printf("Total lines: %d\n", document->size);
+    printf("Total words: %d\n", total_words);
+}
+
+void show_statistics(const Document *document)
+{
+    count_document(document);
 }
 
 char *skip_spaces(char *text)
@@ -567,16 +809,19 @@ int parse_positive_integer(char **cursor, int *value)
 void print_help(void)
 {
     printf("Commands:\n");
-    printf("  insert <line> <text>  Insert text at a 1-based line number.\n");
-    printf("  delete <line>         Delete a line.\n");
-    printf("  display               Print all lines with numbers.\n");
-    printf("  save <file.txt>       Save the document.\n");
-    printf("  load <file.txt>       Replace the document with a file.\n");
-    printf("  search <text>         Print lines containing text.\n");
-    printf("  stats                 Print line, word, and character counts.\n");
-    printf("  undo                  Undo the most recent insert, delete, or load.\n");
-    printf("  help                  Show this help.\n");
-    printf("  quit                  Exit the editor.\n");
+    printf("  insert <line_number> <text>   Insert text at a 1-based line number.\n");
+    printf("  delete <line_number>          Delete a line.\n");
+    printf("  display                       Print all lines with numbers.\n");
+    printf("  append <text>                 Append a new line at the end.\n");
+    printf("  save <file.txt>               Save the document.\n");
+    printf("  load <file.txt>               Replace the document with a file.\n");
+    printf("  search <text>                 Print lines containing text.\n");
+    printf("  replace <line> <old> <new>    Replace the first matching text on a line.\n");
+    printf("  replaceall <old> <new>        Replace all matching text in the document.\n");
+    printf("  undo                          Undo the most recent document-changing action.\n");
+    printf("  count                         Show total lines and total words.\n");
+    printf("  help                          Show this help.\n");
+    printf("  exit / quit                   Exit the editor.\n");
 }
 
 static int command_matches(const char *command, const char *expected)
@@ -644,6 +889,17 @@ int process_command(char *input, Document *document, UndoState *undo_state)
             printf("Deleted line %d.\n", line_number);
         }
     }
+    else if (command_matches(command, "append"))
+    {
+        if (*arguments == '\0')
+        {
+            fprintf(stderr, "Usage: append <text>\n");
+        }
+        else if (append_line_command(document, undo_state, arguments))
+        {
+            printf("Appended a new line.\n");
+        }
+    }
     else if (command_matches(command, "display"))
     {
         display_document(document);
@@ -674,9 +930,91 @@ int process_command(char *input, Document *document, UndoState *undo_state)
     {
         search_document(document, arguments);
     }
-    else if (command_matches(command, "stats"))
+    else if (command_matches(command, "replace"))
     {
-        show_statistics(document);
+        char *cursor = arguments;
+        char *old_text;
+        char *new_text;
+
+        if (!parse_positive_integer(&cursor, &line_number))
+        {
+            fprintf(stderr, "Usage: replace <line> <old_text> <new_text>\n");
+            return 1;
+        }
+
+        cursor = skip_spaces(cursor);
+        if (*cursor == '\0')
+        {
+            fprintf(stderr, "Usage: replace <line> <old_text> <new_text>\n");
+            return 1;
+        }
+
+        old_text = cursor;
+        while (*cursor != '\0' && !isspace((unsigned char)*cursor))
+        {
+            cursor++;
+        }
+
+        if (*cursor == '\0')
+        {
+            fprintf(stderr, "Usage: replace <line> <old_text> <new_text>\n");
+            return 1;
+        }
+
+        *cursor = '\0';
+        new_text = skip_spaces(cursor + 1);
+        if (*new_text == '\0')
+        {
+            fprintf(stderr, "Usage: replace <line> <old_text> <new_text>\n");
+            return 1;
+        }
+
+        if (replace_line(document, undo_state, line_number, old_text, new_text))
+        {
+            printf("Replaced text on line %d.\n", line_number);
+        }
+    }
+    else if (command_matches(command, "replaceall"))
+    {
+        char *cursor = arguments;
+        char *old_text;
+        char *new_text;
+
+        cursor = skip_spaces(cursor);
+        if (*cursor == '\0')
+        {
+            fprintf(stderr, "Usage: replaceall <old_text> <new_text>\n");
+            return 1;
+        }
+
+        old_text = cursor;
+        while (*cursor != '\0' && !isspace((unsigned char)*cursor))
+        {
+            cursor++;
+        }
+
+        if (*cursor == '\0')
+        {
+            fprintf(stderr, "Usage: replaceall <old_text> <new_text>\n");
+            return 1;
+        }
+
+        *cursor = '\0';
+        new_text = skip_spaces(cursor + 1);
+        if (*new_text == '\0')
+        {
+            fprintf(stderr, "Usage: replaceall <old_text> <new_text>\n");
+            return 1;
+        }
+
+        if (replace_all(document, undo_state, old_text, new_text))
+        {
+            printf("Replaced all occurrences.\n");
+        }
+    }
+    else if (command_matches(command, "count") || command_matches(command, "stats"))
+    {
+        count_document(document);
     }
     else if (command_matches(command, "undo"))
     {
